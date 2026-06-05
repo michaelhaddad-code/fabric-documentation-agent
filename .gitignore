@@ -1,0 +1,17 @@
+# Output files (generated docs, not the template)
+fabric_doc_*_2*.xlsx
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+
+# Notebooks (local fallback, not source)
+notebooks/*.ipynb
+
+# IDE
+.vscode/
+.idea/
