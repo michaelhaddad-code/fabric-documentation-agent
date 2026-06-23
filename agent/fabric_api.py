@@ -11,8 +11,14 @@ import requests
 from .auth import get_token
 from .config import FABRIC_API_BASE, FABRIC_RESOURCE, ONELAKE_BLOB_BASE, STORAGE_RESOURCE
 
+PBI_API_BASE = 'https://api.powerbi.com/v1.0/myorg'
+
 
 def _fab_headers() -> dict:
+    return {'Authorization': f'Bearer {get_token(FABRIC_RESOURCE)}'}
+
+
+def _pbi_headers() -> dict:
     return {'Authorization': f'Bearer {get_token(FABRIC_RESOURCE)}'}
 
 
@@ -232,3 +238,89 @@ def list_bronze_files(workspace_id: str, lakehouse_id: str) -> list[dict]:
                 })
 
     return files
+
+
+# ---------------------------------------------------------------------------
+# Power BI reports and pages
+# ---------------------------------------------------------------------------
+
+def list_reports(workspace_id: str) -> list[dict]:
+    """Returns Power BI reports in the workspace, each with id, name, datasetId."""
+    r = requests.get(f'{PBI_API_BASE}/groups/{workspace_id}/reports', headers=_pbi_headers())
+    if r.status_code != 200:
+        return []
+    return r.json().get('value', [])
+
+
+def get_report_pages(workspace_id: str, report_id: str) -> list[dict]:
+    """Returns pages for a report: [{name, displayName, order}], sorted by order."""
+    r = requests.get(
+        f'{PBI_API_BASE}/groups/{workspace_id}/reports/{report_id}/pages',
+        headers=_pbi_headers(),
+    )
+    if r.status_code != 200:
+        return []
+    pages = r.json().get('value', [])
+    return sorted(pages, key=lambda p: p.get('order', 0))
+
+
+def create_warehouse(workspace_id: str, display_name: str) -> dict:
+    """
+    Creates a Fabric Warehouse and waits for provisioning to complete.
+    Returns the warehouse item dict (id, displayName, type, properties).
+    """
+    r = requests.post(
+        f'{FABRIC_API_BASE}/workspaces/{workspace_id}/warehouses',
+        headers=_fab_headers(),
+        json={'displayName': display_name},
+    )
+    if r.status_code == 201:
+        return r.json()
+    if r.status_code == 202:
+        location = r.headers.get('Location') or r.headers.get('location')
+        result = _poll_lro(location, max_wait=120) if location else None
+        if result:
+            # LRO result may contain the item or we need to fetch it
+            item_id = result.get('id') or (result.get('createdArtifact') or {}).get('id')
+            if item_id:
+                r2 = requests.get(
+                    f'{FABRIC_API_BASE}/workspaces/{workspace_id}/warehouses/{item_id}',
+                    headers=_fab_headers(),
+                )
+                if r2.status_code == 200:
+                    return r2.json()
+        # Fall back: find the newly created warehouse by name
+        for item in list_items(workspace_id):
+            if item.get('type') == 'Warehouse' and item.get('displayName') == display_name:
+                r3 = requests.get(
+                    f'{FABRIC_API_BASE}/workspaces/{workspace_id}/warehouses/{item["id"]}',
+                    headers=_fab_headers(),
+                )
+                if r3.status_code == 200:
+                    return r3.json()
+    raise RuntimeError(f'Failed to create warehouse "{display_name}": {r.status_code} {r.text[:200]}')
+
+
+def get_dataset_source_item_id(workspace_id: str, dataset_id: str) -> Optional[str]:
+    """
+    Returns the Fabric item ID (warehouse/lakehouse) that backs a semantic model.
+    Handles both Direct Lake (AzureDataLakeStorage path) and DirectQuery (Sql database GUID).
+    """
+    r = requests.get(
+        f'{PBI_API_BASE}/groups/{workspace_id}/datasets/{dataset_id}/datasources',
+        headers=_pbi_headers(),
+    )
+    if r.status_code != 200:
+        return None
+    for ds in r.json().get('value', []):
+        ds_type = ds.get('datasourceType', '')
+        details = ds.get('connectionDetails', {})
+        if ds_type == 'AzureDataLakeStorage':
+            # path is /workspace_id/item_id/
+            parts = [p for p in details.get('path', '').split('/') if p]
+            if len(parts) >= 2:
+                return parts[1]
+        elif ds_type == 'Sql':
+            # database field is the warehouse item ID for Fabric SQL endpoints
+            return details.get('database')
+    return None

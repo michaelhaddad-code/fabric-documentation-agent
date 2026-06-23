@@ -42,9 +42,16 @@ def _t(ws, row: int, col: int, value: str):
     return cell
 
 
+def _sanitize(value):
+    """Strip Excel-illegal control characters from string values."""
+    if not isinstance(value, str):
+        return value
+    return ''.join(c for c in value if ord(c) >= 32 or c in '\t\n\r')
+
+
 def _v(ws, row: int, col: int, value):
     """Write a plain data cell."""
-    cell = ws.cell(row=row, column=col, value=value)
+    cell = ws.cell(row=row, column=col, value=_sanitize(value))
     cell.font = Font()  # reset any inherited italic from example rows
     return cell
 
@@ -66,11 +73,16 @@ def _clear_rows(ws, from_row: int):
 def write_artifacts(ws, artifacts: list[ArtifactInfo]):
     _clear_rows(ws, from_row=3)
 
+    _h(ws, 2, 5, 'Last Modified')
+    _h(ws, 2, 6, 'Created By')
+
     for i, art in enumerate(artifacts, start=3):
         _v(ws, i, 1, art.display_name)
         _v(ws, i, 2, art.type)
         _v(ws, i, 3, art.workspace_name)
         _v(ws, i, 4, art.description)
+        _v(ws, i, 5, art.last_modified)
+        _v(ws, i, 6, art.created_by)
 
 
 # ---------------------------------------------------------------------------

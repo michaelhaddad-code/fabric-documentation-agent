@@ -15,3 +15,11 @@ notebooks/*.ipynb
 # IDE
 .vscode/
 .idea/
+
+# Runtime / cache
+.cache_*.pkl
+run_log.txt
+*.pbix
+
+# Claude internal
+.claude/

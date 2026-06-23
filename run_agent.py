@@ -7,6 +7,7 @@ Usage:
     python run_agent.py --workspace "XP3R-R&D" --notebooks ./notebooks
 """
 import argparse
+import pickle
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -23,17 +24,24 @@ from agent.auth import get_token
 from agent.fabric_api import (
     find_workspace, list_items, get_lakehouse, get_warehouse,
     get_pipeline_definition, list_bronze_files,
+    list_reports, get_report_pages, get_dataset_source_item_id,
+    create_warehouse,
 )
+from agent.pbix_parser import parse_pbix_page_tables
 from agent.sql_api import SQLClient
 from agent.lineage import build_lineage, parse_pipeline, print_lineage_summary
 from agent.writer import write_output
+from agent.governance_writer import populate_governance, provision_governance_warehouse
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description='Document a Fabric workspace into an Excel spreadsheet.')
+    p = argparse.ArgumentParser(
+        description='Document a Fabric workspace into wh_governance and optionally an Excel file.'
+    )
     p.add_argument('--workspace', required=True, help='Workspace name or ID')
-    p.add_argument('--dry-run', action='store_true', help='Print lineage summary; do not write Excel')
-    p.add_argument('--output', help='Output .xlsx path (default: fabric_doc_<workspace>_<date>.xlsx)')
+    p.add_argument('--dry-run', action='store_true', help='Print summary; do not write anything')
+    p.add_argument('--excel', action='store_true', help='Also write an Excel .xlsx documentation file')
+    p.add_argument('--output', help='Output .xlsx path (implies --excel; default: fabric_doc_<workspace>_<date>.xlsx)')
     p.add_argument('--notebooks', default=str(NOTEBOOKS_DIR), help='Directory for local .ipynb fallback files')
     p.add_argument(
         '--layers', default=None,
@@ -67,10 +75,11 @@ def make_lakehouse(item: dict, detail: dict, workspace_name: str) -> LakehouseIn
     art = make_artifact(item, workspace_name)
     props = detail.get('properties', {})
     sql_ep_props = props.get('sqlEndpointProperties', {})
+    conn_str = sql_ep_props.get('connectionString', '') or props.get('connectionString', '')
     sql_ep = SqlEndpoint(
-        connection_string=sql_ep_props.get('connectionString', ''),
+        connection_string=conn_str,
         endpoint_id=sql_ep_props.get('id', ''),
-    ) if sql_ep_props.get('connectionString') else None
+    ) if conn_str else None
     lh = LakehouseInfo(
         **{k: v for k, v in art.__dict__.items()},
         sql_endpoint=sql_ep,
@@ -81,7 +90,11 @@ def make_lakehouse(item: dict, detail: dict, workspace_name: str) -> LakehouseIn
 
 
 def collect_workspace(workspace_id: str, workspace_name: str, notebooks_dir: Path, layer_filter: set[str] | None = None):
-    """Collect all data from the workspace. Returns structured objects."""
+    """
+    Collect all data from the workspace. Returns structured objects plus the
+    wh_governance SQL endpoint connection string (or None if not found).
+    wh_governance is excluded from the documentation artifacts.
+    """
 
     print(f'\n[1/5] Listing items in workspace "{workspace_name}"...')
     raw_items = list_items(workspace_id)
@@ -96,6 +109,7 @@ def collect_workspace(workspace_id: str, workspace_name: str, notebooks_dir: Pat
     all_artifacts: list[ArtifactInfo] = []
     raw_notebooks: list[dict] = []
     raw_pipelines: list[dict] = []
+    gov_server: str | None = None
 
     print('\n[2/5] Fetching artifact details...')
     for item in in_scope:
@@ -110,6 +124,15 @@ def collect_workspace(workspace_id: str, workspace_name: str, notebooks_dir: Pat
                 all_artifacts.append(lh)
             print(f'      Lakehouse: {lh.display_name}  layer={lh.layer}  sql_ep={bool(lh.sql_endpoint)}')
 
+        elif itype == 'Warehouse' and art.display_name == 'wh_governance':
+            # Capture the governance warehouse endpoint but exclude it from documentation
+            detail = get_warehouse(workspace_id, item['id'])
+            lh = make_lakehouse(item, detail, workspace_name)
+            if lh.sql_endpoint:
+                gov_server = lh.sql_endpoint.connection_string
+            print(f'      Warehouse: {lh.display_name}  [governance target, excluded from docs]')
+            continue
+
         elif itype == 'Warehouse':
             # Warehouses have similar structure to lakehouses but different endpoint
             detail = get_warehouse(workspace_id, item['id'])
@@ -123,7 +146,7 @@ def collect_workspace(workspace_id: str, workspace_name: str, notebooks_dir: Pat
             all_artifacts.append(art)
             print(f'      Notebook:  {art.display_name}')
 
-        elif itype == 'DataflowGen2':
+        elif itype in ('DataflowGen2', 'Dataflow'):
             all_artifacts.append(art)
             print(f'      Dataflow:  {art.display_name}')
 
@@ -164,12 +187,16 @@ def collect_workspace(workspace_id: str, workspace_name: str, notebooks_dir: Pat
         for traw in raw_tables:
             schema = traw['schema']
             tname = traw['table_name']
-
-            cols = client.get_columns(schema, tname)
-            col_names = [c['col_name'] for c in cols]
-            row_count = client.get_row_count(schema, tname)
-            stats = client.get_column_stats(schema, tname, col_names)
-            last_updated = client.get_last_updated(schema, tname, col_names)
+            try:
+                cols = client.get_columns(schema, tname)
+                col_names = [c['col_name'] for c in cols]
+                row_count = client.get_row_count(schema, tname)
+                stats = client.get_column_stats(schema, tname, col_names)
+                last_updated = client.get_last_updated(schema, tname, col_names)
+            except Exception as e:
+                print(f'        {schema}.{tname}: ERROR — {e}  (skipping, reconnecting)')
+                client.close()
+                continue
 
             tbl = TableInfo(
                 table_name=tname,
@@ -178,7 +205,7 @@ def collect_workspace(workspace_id: str, workspace_name: str, notebooks_dir: Pat
                 lh_id=lh.id,
                 layer=lh.layer,
                 workspace_name=workspace_name,
-                description=lh.description,   # table-level desc not available via REST; use LH desc as fallback
+                description=lh.description,
                 row_count=row_count,
                 last_updated=last_updated,
             )
@@ -256,12 +283,13 @@ def collect_workspace(workspace_id: str, workspace_name: str, notebooks_dir: Pat
     # Filter artifacts tab to document-relevant types
     doc_artifacts = [a for a in all_artifacts if a.type in ARTIFACT_TAB_TYPES]
 
-    return doc_artifacts, all_tables, all_columns, gold_silver, silver_bronze, data_sources
+    return doc_artifacts, all_tables, all_columns, gold_silver, silver_bronze, data_sources, gov_server
 
 
 def main():
     args = parse_args()
     notebooks_dir = Path(args.notebooks)
+    write_excel = args.excel or bool(args.output)
 
     layer_filter = (
         {l.strip().capitalize() for l in args.layers.split(',')}
@@ -271,6 +299,7 @@ def main():
     print(f'Fabric Documentation Agent')
     print(f'Workspace : {args.workspace}')
     print(f'Dry run   : {args.dry_run}')
+    print(f'Excel     : {write_excel}')
     print(f'Notebooks : {notebooks_dir}')
     print(f'Layers    : {", ".join(sorted(layer_filter)) if layer_filter else "all"}')
 
@@ -288,38 +317,147 @@ def main():
     workspace_name = ws['displayName']
     print(f'  Workspace ID: {workspace_id}')
 
-    artifacts, tables, columns, gold_silver, silver_bronze, data_sources = collect_workspace(
-        workspace_id, workspace_name, notebooks_dir, layer_filter=layer_filter,
-    )
+    safe_name = workspace_name.replace(' ', '_').replace('/', '_')
+    checkpoint_path = Path(f'.cache_{safe_name}.pkl')
 
+    if checkpoint_path.exists():
+        print(f'\nLoading cached collection from {checkpoint_path}...')
+        with open(checkpoint_path, 'rb') as f:
+            cached = pickle.load(f)
+        # Support old cache format (6-tuple) and new format (7-tuple with gov_server)
+        if len(cached) == 7:
+            artifacts, tables, columns, gold_silver, silver_bronze, data_sources, gov_server = cached
+        else:
+            artifacts, tables, columns, gold_silver, silver_bronze, data_sources = cached
+            gov_server = None
+        print('  Loaded. Skipping API collection.')
+    else:
+        artifacts, tables, columns, gold_silver, silver_bronze, data_sources, gov_server = collect_workspace(
+            workspace_id, workspace_name, notebooks_dir, layer_filter=layer_filter,
+        )
+        with open(checkpoint_path, 'wb') as f:
+            pickle.dump(
+                (artifacts, tables, columns, gold_silver, silver_bronze, data_sources, gov_server), f
+            )
+        print(f'\nCollection cached to {checkpoint_path}')
+
+    print(f'\nCollection complete: {len(artifacts)} artifacts, {len(tables)} tables, {len(columns)} columns')
     print_lineage_summary(gold_silver, silver_bronze)
 
     if args.dry_run:
-        print('\n[dry-run] Skipping Excel output.')
-        print(f'  Artifacts  : {len(artifacts)}')
-        print(f'  Tables     : {len(tables)}')
-        print(f'  Columns    : {len(columns)}')
-        print(f'  G->S rows   : {len(gold_silver)}')
-        print(f'  S->B rows   : {len(silver_bronze)}')
+        print('\n[dry-run] No writes.')
+        print(f'  Artifacts   : {len(artifacts)}')
+        print(f'  Tables      : {len(tables)}')
+        print(f'  Columns     : {len(columns)}')
+        print(f'  G->S edges  : {len(gold_silver)}')
+        print(f'  S->B edges  : {len(silver_bronze)}')
         print(f'  Data Sources: {len(data_sources)}')
+        print(f'  wh_governance server: {gov_server or "not found — would be created"}')
         return
 
-    if args.output:
-        output_path = Path(args.output)
-    else:
-        date_str = datetime.now().strftime('%Y%m%d_%H%M')
-        safe_name = workspace_name.replace(' ', '_').replace('/', '_')
-        output_path = Path(f'fabric_doc_{safe_name}_{date_str}.xlsx')
+    # ------------------------------------------------------------------
+    # Excel output (optional)
+    # ------------------------------------------------------------------
+    if write_excel:
+        if args.output:
+            output_path = Path(args.output)
+        else:
+            date_str = datetime.now().strftime('%Y%m%d_%H%M')
+            output_path = Path(f'fabric_doc_{safe_name}_{date_str}.xlsx')
 
-    write_output(
-        template_path=TEMPLATE_PATH,
-        output_path=output_path,
+        write_output(
+            template_path=TEMPLATE_PATH,
+            output_path=output_path,
+            artifacts=artifacts,
+            tables=tables,
+            columns=columns,
+            gold_silver=gold_silver,
+            silver_bronze=silver_bronze,
+            data_sources=data_sources,
+        )
+
+    # ------------------------------------------------------------------
+    # wh_governance — create if missing, provision schema/tables, populate
+    # ------------------------------------------------------------------
+    if gov_server is None:
+        print(f'\nwh_governance not found in cache — creating or locating...')
+        try:
+            wh_detail = create_warehouse(workspace_id, 'wh_governance')
+            print('  Created new wh_governance.')
+        except RuntimeError as e:
+            if '409' not in str(e) and 'AlreadyInUse' not in str(e):
+                raise
+            print('  Already exists in workspace — finding connection string...')
+            raw_items = list_items(workspace_id)
+            gov_item = next(
+                (i for i in raw_items
+                 if i.get('type') == 'Warehouse' and i.get('displayName') == 'wh_governance'),
+                None,
+            )
+            if not gov_item:
+                print('  ERROR: could not find wh_governance in workspace')
+                sys.exit(1)
+            wh_detail = get_warehouse(workspace_id, gov_item['id'])
+
+        props = wh_detail.get('properties', {})
+        gov_server = (
+            props.get('connectionString')
+            or props.get('sqlEndpointProperties', {}).get('connectionString')
+        )
+        if not gov_server:
+            print('  ERROR: could not retrieve connection string for wh_governance')
+            sys.exit(1)
+        print(f'  Server: {gov_server}')
+
+        # Update cache so future runs skip this lookup
+        with open(checkpoint_path, 'wb') as f:
+            pickle.dump(
+                (artifacts, tables, columns, gold_silver, silver_bronze, data_sources, gov_server), f
+            )
+        print('  Cache updated with gov_server.')
+
+    print('\nProvisioning wh_governance schema and tables...')
+    provision_governance_warehouse(gov_server)
+
+    print('\nCollecting reports and pages...')
+    reports_with_pages = []
+    report_warehouse_map: dict[str, str] = {}
+    seen_datasets: set[str] = set()
+    for rpt in list_reports(workspace_id):
+        pages = get_report_pages(workspace_id, rpt['id'])
+        reports_with_pages.append({**rpt, 'pages': pages})
+        ds_id = rpt.get('datasetId', '')
+        if ds_id and ds_id not in seen_datasets:
+            seen_datasets.add(ds_id)
+            item_id = get_dataset_source_item_id(workspace_id, ds_id)
+            if item_id:
+                report_warehouse_map[ds_id] = item_id
+        print(f'  {rpt["name"]}: {len(pages)} pages, source={report_warehouse_map.get(ds_id, "unknown")}')
+
+    print('\nParsing PBIX files for page->table mapping...')
+    known_tables = {t.table_name.lower() for t in tables}
+    report_page_tables: dict[str, dict[str, set[str]]] = {}
+    for rpt in reports_with_pages:
+        page_map = parse_pbix_page_tables(workspace_id, rpt['id'], known_tables=known_tables)
+        if page_map:
+            report_page_tables[rpt['id']] = page_map
+            total_refs = sum(len(v) for v in page_map.values())
+            print(f'  {rpt["name"]}: {len(page_map)} pages, {total_refs} table refs parsed')
+        else:
+            print(f'  {rpt["name"]}: PBIX export failed, falling back to report-level')
+
+    populate_governance(
+        server=gov_server,
+        workspace_id=workspace_id,
+        workspace_name=workspace_name,
         artifacts=artifacts,
         tables=tables,
         columns=columns,
         gold_silver=gold_silver,
         silver_bronze=silver_bronze,
-        data_sources=data_sources,
+        reports=reports_with_pages,
+        report_warehouse_map=report_warehouse_map,
+        report_page_tables=report_page_tables,
     )
 
 

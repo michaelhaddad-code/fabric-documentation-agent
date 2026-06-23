@@ -15,10 +15,10 @@ TEMPLATE_PATH = PROJECT_ROOT / 'fabric_doc_template.xlsx'
 NOTEBOOKS_DIR = PROJECT_ROOT / 'notebooks'
 
 # Item types returned by the items API that we care about
-IN_SCOPE_TYPES = {'Lakehouse', 'Warehouse', 'Notebook', 'DataflowGen2', 'DataPipeline'}
+IN_SCOPE_TYPES = {'Lakehouse', 'Warehouse', 'Notebook', 'DataflowGen2', 'Dataflow', 'DataPipeline'}
 
 # Types that appear in Fabric Artifacts tab (excludes pipelines, which are orchestration not artifacts)
-ARTIFACT_TAB_TYPES = {'Lakehouse', 'Warehouse', 'Notebook', 'DataflowGen2'}
+ARTIFACT_TAB_TYPES = {'Lakehouse', 'Warehouse', 'Notebook', 'DataflowGen2', 'Dataflow'}
 
 # Types that have queryable SQL endpoints
 SQL_ENDPOINT_TYPES = {'Lakehouse', 'Warehouse'}
@@ -31,6 +31,7 @@ TIMESTAMP_COLUMNS = [
     'ingestion_date', 'load_date', 'loaded_at', 'updated_at',
     'modified_at', '_created_at', 'last_modified',
 ]
+
 
 
 def detect_layer(display_name: str, description: str = '') -> str:

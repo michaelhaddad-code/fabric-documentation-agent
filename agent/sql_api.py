@@ -31,11 +31,15 @@ class SQLClient:
                 f'SERVER={self.server};'
                 f'DATABASE={self.database};'
                 f'Encrypt=yes;'
+                f'Connection Timeout=30;'
             )
             self._conn = pyodbc.connect(
                 conn_str,
                 attrs_before={self.SQL_COPT_SS_ACCESS_TOKEN: _build_token_struct()},
+                timeout=30,
+                autocommit=True,
             )
+            self._conn.timeout = 120
         return self._conn
 
     def close(self):

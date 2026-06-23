@@ -134,7 +134,7 @@ def build_lineage(
     """
     # Index artifacts by id
     nb_items = {i.id: i for i in all_items if i.type == 'Notebook'}
-    df_items = {i.id: i for i in all_items if i.type == 'DataflowGen2'}
+    df_items = {i.id: i for i in all_items if i.type in ('DataflowGen2', 'Dataflow')}
 
     # Resolve notebook/dataflow sources (reads/writes)
     sources: dict[str, NotebookSource] = {}
@@ -261,6 +261,18 @@ def build_lineage(
                     print(f'  Name-inferred: {nb_item.display_name} -> reads {read_layer}, writes {write_layer}')
                 break
 
+    # Infer layer transitions for dataflows from their names (same logic as notebooks)
+    for df_id, df_item in df_items.items():
+        if df_id in nb_write_layer:
+            continue
+        name = df_item.display_name.lower()
+        for keywords, read_layer, write_layer in _NAME_TRANSITIONS:
+            if any(kw in name for kw in keywords):
+                nb_read_layer[df_id] = read_layer
+                nb_write_layer[df_id] = write_layer
+                print(f'  Name-inferred dataflow: {df_item.display_name} -> reads {read_layer}, writes {write_layer}')
+                break
+
     def _get_artifact_name(artifact_id: str) -> str:
         item = nb_items.get(artifact_id) or df_items.get(artifact_id)
         return item.display_name if item else artifact_id
@@ -279,12 +291,18 @@ def build_lineage(
                 nid for nid, ns in sources.items()
                 if tname in ns.writes
             ]
-            # Fallback: notebook whose write_layer is Gold (pipeline inference)
+            # Fallback: narrow by warehouse name, then take 1 Gold-writer (mirrors Silver→Bronze domain fix)
             if not writing_nbs:
-                writing_nbs = [
+                lh_domain = lh.display_name.lower()
+                for strip in ('gold_wh_', 'gold_lh_', 'gold_', '_wh', '_warehouse', '_lakehouse'):
+                    lh_domain = lh_domain.replace(strip, '')
+                matched = [
                     nid for nid, wl in nb_write_layer.items()
-                    if wl == 'Gold'
+                    if wl == 'Gold' and lh_domain in _get_artifact_name(nid).lower()
                 ]
+                writing_nbs = matched if matched else [
+                    nid for nid, wl in nb_write_layer.items() if wl == 'Gold'
+                ][:1]
                 confidence = INFERRED
                 notes = 'INFERRED: no source code available; assigned from pipeline position'
             else:
@@ -329,10 +347,15 @@ def build_lineage(
                 if tname in ns.writes
             ]
             if not writing_nbs:
-                writing_nbs = [
+                # Narrow by domain: strip 'silver_lh_'/'silver_' prefix and match to notebook name
+                lh_domain = lh.display_name.lower().replace('silver_lh_', '').replace('silver_', '')
+                matched = [
                     nid for nid, wl in nb_write_layer.items()
-                    if wl == 'Silver'
+                    if wl == 'Silver' and lh_domain in _get_artifact_name(nid).lower()
                 ]
+                writing_nbs = matched if matched else [
+                    nid for nid, wl in nb_write_layer.items() if wl == 'Silver'
+                ][:1]
                 confidence = INFERRED
                 notes = 'INFERRED: no source code available; assigned from pipeline position'
             else:
