@@ -25,9 +25,9 @@ from agent.fabric_api import (
     find_workspace, list_items, get_lakehouse, get_warehouse,
     get_pipeline_definition, list_bronze_files,
     list_reports, get_report_pages, get_dataset_source_item_id,
-    create_warehouse,
+    create_warehouse, get_semantic_model_definition, get_report_definition,
 )
-from agent.pbix_parser import parse_pbix_page_tables
+from agent.pbix_parser import parse_pbix_page_tables, parse_sm_measure_deps, fetch_sm_measure_deps
 from agent.sql_api import SQLClient
 from agent.lineage import build_lineage, parse_pipeline, print_lineage_summary
 from agent.writer import write_output
@@ -434,11 +434,32 @@ def main():
                 report_warehouse_map[ds_id] = item_id
         print(f'  {rpt["name"]}: {len(pages)} pages, source={report_warehouse_map.get(ds_id, "unknown")}')
 
-    print('\nParsing PBIX files for page->table mapping...')
+    print('\nFetching semantic model measure expressions via DAX INFO functions...')
     known_tables = {t.table_name.lower() for t in tables}
+    sm_measure_deps: dict[str, set[str]] = {}
+    for ds_id in seen_datasets:
+        deps = fetch_sm_measure_deps(workspace_id, ds_id, known_tables)
+        if deps:
+            sm_measure_deps.update(deps)
+            print(f'  dataset {ds_id[:8]}...: {len(deps)} measure group(s) resolved')
+        else:
+            # Fall back to TMDL definition (for TMDL-native models)
+            sm_parts = get_semantic_model_definition(workspace_id, ds_id)
+            if sm_parts:
+                deps = parse_sm_measure_deps(sm_parts, known_tables)
+                sm_measure_deps.update(deps)
+                print(f'  dataset {ds_id[:8]}...: {len(deps)} measure group(s) from TMDL')
+            else:
+                print(f'  dataset {ds_id[:8]}...: no measure data available')
+
+    print('\nParsing PBIX files for page->table mapping...')
     report_page_tables: dict[str, dict[str, set[str]]] = {}
     for rpt in reports_with_pages:
-        page_map = parse_pbix_page_tables(workspace_id, rpt['id'], known_tables=known_tables)
+        page_map = parse_pbix_page_tables(
+            workspace_id, rpt['id'],
+            known_tables=known_tables,
+            measure_deps=sm_measure_deps or None,
+        )
         if page_map:
             report_page_tables[rpt['id']] = page_map
             total_refs = sum(len(v) for v in page_map.values())

@@ -282,15 +282,17 @@ def populate_governance(
     )
 
     for report in reports_ordered:
-        report_id   = report['id']
-        report_name = report['name']
-        dataset_id  = report.get('datasetId', '')
-        pages       = report.get('pages', [])
+        report_id     = report['id']
+        report_name   = report['name']
+        dataset_id    = report.get('datasetId', '')
+        pages         = report.get('pages', [])
+        report_owner  = report.get('createdBy') or report.get('modifiedBy') or None
 
         obj_rows.append(_obj(
             report_id, 'Report', report_name,
             f'{workspace_name}.{report_name}',
             parent_objects_id=workspace_id,
+            owner_email=report_owner,
         ))
 
         source_lh_id = report_warehouse_map.get(dataset_id)
@@ -304,11 +306,18 @@ def populate_governance(
             page_display  = page['displayName']
             page_obj_id   = _sha256(report_id, page_internal)
             page_obj_ids[page_internal] = page_obj_id
+            raw_vis       = page.get('visibility')
+            page_props    = json.dumps({
+                'order':      page.get('order', 0),
+                'visibility': 'hidden' if raw_vis == 'HiddenInPublic' else 'visible',
+            })
 
             obj_rows.append(_obj(
                 page_obj_id, 'Page', page_display,
                 f'{workspace_name}.{report_name}.{page_display}',
                 parent_objects_id=report_id,
+                owner_email=report_owner,
+                properties_json=page_props,
             ))
 
         # Build table -> page from PBIX (first page by order wins within this report)

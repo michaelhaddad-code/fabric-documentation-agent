@@ -301,6 +301,67 @@ def create_warehouse(workspace_id: str, display_name: str) -> dict:
     raise RuntimeError(f'Failed to create warehouse "{display_name}": {r.status_code} {r.text[:200]}')
 
 
+def get_report_definition(workspace_id: str, report_id: str) -> list[dict]:
+    """
+    Returns the PBIP definition parts for a Report item via the Fabric getDefinition API.
+    For PBIP-native reports this includes visual.json files for every visual AND the
+    semantic model TMDL files (table/measure definitions), giving us both the page→entity
+    mapping and the measure expressions needed to resolve measure-group pages.
+    Returns empty list for PBIX-based reports or if the API is unavailable.
+    """
+    r = requests.post(
+        f'{FABRIC_API_BASE}/workspaces/{workspace_id}/items/{report_id}/getDefinition',
+        headers=_fab_headers(),
+    )
+    if r.status_code == 200:
+        return r.json().get('definition', {}).get('parts', [])
+    if r.status_code == 202:
+        location = r.headers.get('Location') or r.headers.get('location')
+        result = _poll_lro(location) if location else None
+        return result.get('definition', {}).get('parts', []) if result else []
+    return []
+
+
+def get_semantic_model_definition(workspace_id: str, model_id: str) -> list[dict]:
+    """
+    Returns the TMDL definition parts for a semantic model (dataset) item.
+    Each part has 'path' and 'payload' (base64-encoded content).
+    Returns empty list if the API is unavailable or the model is PBIX-based.
+    """
+    r = requests.post(
+        f'{FABRIC_API_BASE}/workspaces/{workspace_id}/items/{model_id}/getDefinition',
+        headers=_fab_headers(),
+    )
+    if r.status_code == 200:
+        return r.json().get('definition', {}).get('parts', [])
+    if r.status_code == 202:
+        location = r.headers.get('Location') or r.headers.get('location')
+        result = _poll_lro(location) if location else None
+        return result.get('definition', {}).get('parts', []) if result else []
+    return []
+
+
+def execute_dataset_query(workspace_id: str, dataset_id: str, dax: str) -> list[dict]:
+    """
+    Execute a DAX query against a Power BI dataset via the executeQueries API.
+    Returns the list of row dicts from the first result table, or empty list on error.
+    """
+    r = requests.post(
+        f'{PBI_API_BASE}/groups/{workspace_id}/datasets/{dataset_id}/executeQueries',
+        headers=_pbi_headers(),
+        json={'queries': [{'query': dax}]},
+    )
+    if r.status_code != 200:
+        return []
+    results = r.json().get('results', [])
+    if not results:
+        return []
+    tables = results[0].get('tables', [])
+    if not tables:
+        return []
+    return tables[0].get('rows', [])
+
+
 def get_dataset_source_item_id(workspace_id: str, dataset_id: str) -> Optional[str]:
     """
     Returns the Fabric item ID (warehouse/lakehouse) that backs a semantic model.
