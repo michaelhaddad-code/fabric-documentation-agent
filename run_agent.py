@@ -9,6 +9,7 @@ Usage:
 import argparse
 import pickle
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -158,6 +159,40 @@ def collect_workspace(workspace_id: str, workspace_name: str, notebooks_dir: Pat
     all_tables: list[TableInfo] = []
     all_columns: list[ColumnInfo] = []
 
+    TABLE_WORKERS = 8  # parallel connections per lakehouse/warehouse
+
+    def _fetch_table(conn_str: str, lh_display: str, lh_id: str, lh_layer: str,
+                     lh_desc: str, traw: dict) -> tuple:
+        """Query one table's columns, row count, stats, and last-updated. Own connection."""
+        schema = traw['schema']
+        tname  = traw['table_name']
+        c = SQLClient(conn_str, lh_display)
+        try:
+            cols         = c.get_columns(schema, tname)
+            col_names    = [col['col_name'] for col in cols]
+            row_count    = c.get_row_count(schema, tname)
+            stats        = c.get_column_stats(schema, tname, col_names)
+            last_updated = c.get_last_updated(schema, tname, col_names)
+        finally:
+            c.close()
+        tbl = TableInfo(
+            table_name=tname, schema_name=schema,
+            lh_name=lh_display, lh_id=lh_id, layer=lh_layer,
+            workspace_name=workspace_name, description=lh_desc,
+            row_count=row_count, last_updated=last_updated,
+        )
+        col_objs = []
+        for col in cols:
+            s = stats.get(col['col_name'], {})
+            col_objs.append(ColumnInfo(
+                lh_name=lh_display, table_name=tname,
+                col_name=col['col_name'], datatype=col['datatype'],
+                is_nullable=col['is_nullable'],
+                sample_value=s.get('sample', ''),
+                pct_null=s.get('pct_null', ''),
+            ))
+        return tbl, col_objs
+
     for lh in lakehouses:
         if layer_filter and lh.layer not in layer_filter:
             print(f'      {lh.display_name}: skipped (layer={lh.layer}, not in --layers filter)')
@@ -170,64 +205,44 @@ def collect_workspace(workspace_id: str, workspace_name: str, notebooks_dir: Pat
             lh._tables = []
             continue
 
-        client = SQLClient(lh.sql_endpoint.connection_string, lh.display_name)
+        conn_str = lh.sql_endpoint.connection_string
+        list_client = SQLClient(conn_str, lh.display_name)
         try:
-            raw_tables = client.get_tables()
+            raw_tables = list_client.get_tables()
         except Exception as e:
             print(f'      {lh.display_name}: SQL connection failed — {e}')
             lh._tables = []
             continue
+        finally:
+            list_client.close()
 
         lh._tables = []
         if not raw_tables:
             print(f'      {lh.display_name}: no registered tables (may be Files-only bronze layer)')
-        else:
-            print(f'      {lh.display_name}: {len(raw_tables)} table(s)')
+            continue
 
-        for traw in raw_tables:
-            schema = traw['schema']
-            tname = traw['table_name']
-            try:
-                cols = client.get_columns(schema, tname)
-                col_names = [c['col_name'] for c in cols]
-                row_count = client.get_row_count(schema, tname)
-                stats = client.get_column_stats(schema, tname, col_names)
-                last_updated = client.get_last_updated(schema, tname, col_names)
-            except Exception as e:
-                print(f'        {schema}.{tname}: ERROR — {e}  (skipping, reconnecting)')
-                client.close()
-                continue
+        print(f'      {lh.display_name}: {len(raw_tables)} table(s) — querying in parallel (workers={TABLE_WORKERS})')
 
-            tbl = TableInfo(
-                table_name=tname,
-                schema_name=schema,
-                lh_name=lh.display_name,
-                lh_id=lh.id,
-                layer=lh.layer,
-                workspace_name=workspace_name,
-                description=lh.description,
-                row_count=row_count,
-                last_updated=last_updated,
-            )
-            lh._tables.append(tbl)
-            all_tables.append(tbl)
-
-            for c in cols:
-                cname = c['col_name']
-                s = stats.get(cname, {})
-                all_columns.append(ColumnInfo(
-                    lh_name=lh.display_name,
-                    table_name=tname,
-                    col_name=cname,
-                    datatype=c['datatype'],
-                    is_nullable=c['is_nullable'],
-                    sample_value=s.get('sample', ''),
-                    pct_null=s.get('pct_null', ''),
-                ))
-
-            print(f'        {schema}.{tname}: {row_count} rows, {len(cols)} cols, last_updated={last_updated or "n/a"}')
-
-        client.close()
+        with ThreadPoolExecutor(max_workers=TABLE_WORKERS) as pool:
+            future_map = {
+                pool.submit(
+                    _fetch_table, conn_str,
+                    lh.display_name, lh.id, lh.layer, lh.description, traw
+                ): traw
+                for traw in raw_tables
+            }
+            for future in as_completed(future_map):
+                traw = future_map[future]
+                schema = traw['schema']
+                tname  = traw['table_name']
+                try:
+                    tbl, col_objs = future.result()
+                    lh._tables.append(tbl)
+                    all_tables.append(tbl)
+                    all_columns.extend(col_objs)
+                    print(f'        {schema}.{tname}: {tbl.row_count} rows, {len(col_objs)} cols, last_updated={tbl.last_updated or "n/a"}')
+                except Exception as e:
+                    print(f'        {schema}.{tname}: ERROR — {e}  (skipping)')
 
     # List bronze files for Data Sources
     for lh in lakehouses:
