@@ -135,6 +135,66 @@ def _parse_measure_deps(
     return deps
 
 
+def fetch_sm_measure_deps_xmla(
+    workspace_name: str,
+    dataset_name: str,
+    known_tables: set[str],
+) -> dict[str, set[str]]:
+    """
+    Fetch measure-group → physical table dependencies via XMLA (MSOLAP.8 OLEDB).
+    Bypasses the tenant restriction on the executeQueries REST API.
+
+    Requires: pip install adodbapi  (MSOLAP.8 is installed with Power BI Desktop)
+    Returns empty dict on any failure so callers can fall back gracefully.
+    """
+    try:
+        import adodbapi
+    except ImportError:
+        return {}
+
+    from .auth import get_token
+    from .config import FABRIC_RESOURCE
+
+    token = get_token(FABRIC_RESOURCE)
+    conn_str = (
+        f"Provider=MSOLAP.8;"
+        f"Data Source=powerbi://api.powerbi.com/v1.0/myorg/{workspace_name};"
+        f"Initial Catalog={dataset_name};"
+        f"User ID=;"
+        f"Password={token};"
+    )
+
+    conn = None
+    try:
+        conn = adodbapi.connect(conn_str)
+        cur = conn.cursor()
+
+        cur.execute("SELECT [ID], [Name] FROM $SYSTEM.TMSCHEMA_TABLES")
+        id_to_table: dict[str, str] = {str(r[0]): str(r[1]) for r in cur.fetchall()}
+
+        cur.execute("SELECT [TableID], [Expression] FROM $SYSTEM.TMSCHEMA_MEASURES")
+        measure_rows = list(cur.fetchall())
+    except Exception as e:
+        print(f"    [XMLA] {dataset_name}: {e}")
+        return {}
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    deps: dict[str, set[str]] = {}
+    for row in measure_rows:
+        tname = id_to_table.get(str(row[0]), '')
+        if not tname or tname.lower() in known_tables:
+            continue
+        refs = _extract_dax_table_refs(str(row[1] or ''), known_tables)
+        if refs:
+            deps.setdefault(tname.lower(), set()).update(refs)
+    return deps
+
+
 def fetch_sm_measure_deps(
     workspace_id: str,
     dataset_id: str,
@@ -284,6 +344,220 @@ def _parse_pbip_page_tables(
             elif el in measure_deps:
                 physical |= measure_deps[el]
         result[page_id] = physical
+
+    return result
+
+
+def build_pbip_zip_index(zip_path: str) -> dict[str, tuple[str, str]]:
+    """
+    Scan a PBIP ZIP and return {sm_id_lower: (zip_folder, report_folder_base)}.
+
+    sm_id is parsed from the semanticmodelid= query param in each definition.pbir
+    connectionString. report_folder_base is the path prefix inside the ZIP
+    (e.g. 'Broker_Scorecard/Broker_Scorecard.Report').
+    """
+    index: dict[str, tuple[str, str]] = {}
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        for name in z.namelist():
+            if not name.replace('\\', '/').endswith('definition.pbir'):
+                continue
+            try:
+                pbir = json.loads(z.read(name))
+            except Exception:
+                continue
+            conn_str = (
+                pbir.get('datasetReference', {})
+                    .get('byConnection', {})
+                    .get('connectionString', '')
+            )
+            m = re.search(r'semanticmodelid=([0-9a-f-]{36})', conn_str, re.IGNORECASE)
+            if not m:
+                continue
+            sm_id = m.group(1).lower()
+            parts = name.replace('\\', '/').split('/')
+            if len(parts) >= 3:
+                report_folder = '/'.join(parts[:2])  # e.g. 'Broker_Scorecard/Broker_Scorecard.Report'
+                index[sm_id] = (parts[0], report_folder)
+    return index
+
+
+def parse_pbip_zip_page_tables(
+    zip_path: str,
+    report_folder: str,
+    known_tables: Optional[set[str]] = None,
+    measure_deps: Optional[dict[str, set[str]]] = None,
+) -> dict[str, set[str]]:
+    """
+    Parse a PBIP report from a local ZIP file.
+    report_folder: path prefix inside the ZIP (e.g. 'Broker_Scorecard/Broker_Scorecard.Report').
+    Returns {page_internal_id: set[physical_table_name.lower()]}.
+
+    measure_deps: {measure_group_name.lower(): set[physical_table_name.lower()]}.
+      When provided, visuals that reference a measure group are resolved to the
+      underlying physical tables (same two-step lookup used by _parse_pbip_page_tables).
+    """
+    base = f'{report_folder}/definition'
+    raw_result: dict[str, set[str]] = {}
+    page_order: list[str] = []
+
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        all_names = z.namelist()
+
+        pages_meta_path = f'{base}/pages/pages.json'
+        if pages_meta_path in all_names:
+            try:
+                page_order = json.loads(z.read(pages_meta_path)).get('pageOrder', [])
+            except Exception:
+                pass
+
+        page_re = re.compile(
+            r'^' + re.escape(base) + r'/pages/([^/]+)/visuals/[^/]+/visual\.json$'
+        )
+        for name in all_names:
+            m = page_re.match(name)
+            if not m:
+                continue
+            page_id = m.group(1)
+            try:
+                entities = _extract_entities(json.loads(z.read(name)))
+                raw_result.setdefault(page_id, set()).update(entities)
+            except Exception:
+                continue
+
+    if known_tables is None:
+        return raw_result
+
+    result: dict[str, set[str]] = {}
+    for page_id in (page_order if page_order else raw_result.keys()):
+        entities = raw_result.get(page_id, set())
+        physical: set[str] = set()
+        for entity in entities:
+            el = entity.lower()
+            if el in known_tables:
+                physical.add(el)
+            elif measure_deps and el in measure_deps:
+                physical |= measure_deps[el]
+        result[page_id] = physical
+    return result
+
+
+# ── Visual parsing (adapted from pbi-autogov) ─────────────────────────────
+
+SKIP_VISUAL_TYPES = {
+    'actionButton', 'image', 'textbox', 'shape',
+    'bookmarkNavigator', 'pageNavigator', 'groupShape',
+}
+
+_VISUAL_TYPE_DISPLAY = {
+    'barChart': 'Bar Chart', 'clusteredBarChart': 'Clustered Bar Chart',
+    'clusteredColumnChart': 'Clustered Column Chart', 'stackedBarChart': 'Stacked Bar Chart',
+    'stackedColumnChart': 'Stacked Column Chart', 'lineChart': 'Line Chart',
+    'areaChart': 'Area Chart', 'stackedAreaChart': 'Stacked Area Chart',
+    'ribbonChart': 'Ribbon Chart', 'waterfallChart': 'Waterfall Chart',
+    'funnelChart': 'Funnel Chart', 'pieChart': 'Pie Chart', 'donutChart': 'Donut Chart',
+    'treemap': 'Treemap', 'map': 'Map', 'filledMap': 'Filled Map', 'shapeMap': 'Shape Map',
+    'tableEx': 'Table', 'pivotTable': 'Matrix', 'card': 'Card',
+    'multiRowCard': 'Multi-Row Card', 'kpi': 'KPI', 'gauge': 'Gauge',
+    'slicer': 'Slicer', 'scatterChart': 'Scatter Chart',
+    'decompositionTreeVisual': 'Decomposition Tree', 'keyDriversVisual': 'Key Influencers',
+    'cardVisual': 'New Card', 'advancedSlicerVisual': 'New Slicer',
+}
+
+
+def _visual_display_name(vis_type: str) -> str:
+    if vis_type in _VISUAL_TYPE_DISPLAY:
+        return _VISUAL_TYPE_DISPLAY[vis_type]
+    return re.sub(r'([A-Z])', r' \1', vis_type).strip().title()
+
+
+def _visual_title(vis: dict) -> str:
+    """Extract explicit title set by the report author, if any."""
+    try:
+        for t in vis.get('visualContainerObjects', {}).get('title', []):
+            val = (
+                t.get('properties', {})
+                 .get('text', {})
+                 .get('expr', {})
+                 .get('Literal', {})
+                 .get('Value', '')
+            )
+            cleaned = val.strip("'")
+            if cleaned:
+                return cleaned
+    except (KeyError, TypeError):
+        pass
+    return ''
+
+
+def parse_pbip_zip_visuals(
+    zip_path: str,
+    report_folder: str,
+    known_tables: Optional[set[str]] = None,
+    measure_deps: Optional[dict[str, set[str]]] = None,
+) -> dict[str, list[dict]]:
+    """
+    Parse individual visuals from a PBIP ZIP file.
+
+    Returns {page_internal_id: [{'name': str, 'type': str,
+                                  'physical_tables': set[str]}]}.
+    Decoration-only visuals (image, textbox, shape, etc.) are skipped.
+    Visuals with no resolvable physical table references are also skipped.
+    """
+    base = f'{report_folder}/definition'
+    result: dict[str, list[dict]] = {}
+    page_type_counts: dict[str, dict[str, int]] = {}
+
+    visual_re = re.compile(
+        r'^' + re.escape(base) + r'/pages/([^/]+)/visuals/[^/]+/visual\.json$'
+    )
+
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        for name in sorted(z.namelist()):
+            m = visual_re.match(name)
+            if not m:
+                continue
+            page_id = m.group(1)
+
+            try:
+                vis_json = json.loads(z.read(name))
+            except Exception:
+                continue
+
+            vis = vis_json.get('visual', {})
+            vis_type = vis.get('visualType', 'unknown')
+
+            if vis_type in SKIP_VISUAL_TYPES:
+                continue
+
+            # Resolve display name
+            title = _visual_title(vis)
+            if not title:
+                counts = page_type_counts.setdefault(page_id, {})
+                counts[vis_type] = counts.get(vis_type, 0) + 1
+                n = counts[vis_type]
+                base_name = _visual_display_name(vis_type)
+                title = base_name if n == 1 else f'{base_name} ({n})'
+
+            # Collect all SM entity references via existing recursive scanner
+            sm_entities = _extract_entities(vis_json)
+
+            # Resolve SM entity names → physical table names
+            physical: set[str] = set()
+            for entity in sm_entities:
+                el = entity.lower()
+                if known_tables is None or el in known_tables:
+                    physical.add(el)
+                elif measure_deps and el in measure_deps:
+                    physical |= measure_deps[el]
+
+            if not physical:
+                continue
+
+            result.setdefault(page_id, []).append({
+                'name': title,
+                'type': vis_type,
+                'physical_tables': physical,
+            })
 
     return result
 

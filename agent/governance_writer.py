@@ -5,8 +5,10 @@ Objects hierarchy:
   Workspace
   ├── Artifacts (Lakehouse/Warehouse/Notebook/Dataflow) — referenced by relationships
   ├── Report (parent=Workspace)
-  │   ├── Page (parent=Report)
-  │   └── Table (parent=Page when PBIX data available, else parent=Report)
+  │   └── Page (parent=Report)
+  │       └── Visual (parent=Page, when PBIP ZIP available)
+  Relationships store page→table and visual→table edges (many-to-many).
+  Tables are always parented to their Lakehouse/Warehouse artifact.
   │       └── Column
   └── Tables with no connected report (parent=their Artifact)
       └── Column
@@ -77,6 +79,14 @@ REL_SQL = '''INSERT INTO data_lineage.relationships (
 
 
 SCHEMA_DDL = 'CREATE SCHEMA data_lineage'
+
+MEASURE_DEPS_DDL = '''
+CREATE TABLE data_lineage.measure_deps (
+    sm_name             VARCHAR(256)    NOT NULL,
+    measure_group       VARCHAR(256)    NOT NULL,
+    physical_table      VARCHAR(256)    NOT NULL,
+    updated_datetime    DATETIME2(3)    NOT NULL
+)'''
 
 OBJECTS_DDL = '''
 CREATE TABLE data_lineage.objects (
@@ -162,11 +172,47 @@ def provision_governance_warehouse(server: str):
     else:
         print('  Table data_lineage.relationships already exists')
 
+    # Measure deps table (populated by the nb_extract_measure_deps Fabric notebook)
+    cur.execute(
+        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
+        "WHERE TABLE_SCHEMA = 'data_lineage' AND TABLE_NAME = 'measure_deps'"
+    )
+    if cur.fetchone()[0] == 0:
+        cur.execute(MEASURE_DEPS_DDL)
+        print('  Created table: data_lineage.measure_deps')
+    else:
+        print('  Table data_lineage.measure_deps already exists')
+
     conn.close()
+
+
+def read_measure_deps(server: str, known_tables: set[str]) -> dict[str, set[str]]:
+    """
+    Read measure group → physical table mappings written by the
+    nb_extract_measure_deps Fabric notebook.
+    Returns {measure_group_name.lower(): set[physical_table_name.lower()]}.
+    Only includes physical_table values that exist in known_tables.
+    """
+    conn = _connect(server)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT measure_group, physical_table FROM data_lineage.measure_deps"
+        )
+        deps: dict[str, set[str]] = {}
+        for mg, pt in cur.fetchall():
+            if pt.lower() in known_tables:
+                deps.setdefault(mg.lower(), set()).add(pt.lower())
+        return deps
+    except Exception:
+        return {}
+    finally:
+        conn.close()
 
 
 def _bulk_insert(server: str, sql: str, rows: list[tuple], label: str):
     """Insert rows in chunks, reconnecting and retrying on TCP failures."""
+    get_token(SQL_RESOURCE, force_refresh=True)  # ensure fresh token before opening connection
     conn = _connect(server)
     cur = conn.cursor()
     cur.fast_executemany = True
@@ -204,15 +250,19 @@ def populate_governance(
     silver_bronze: list[LineageEdge],
     reports: list[dict],
     report_warehouse_map: dict[str, str],  # dataset_id -> warehouse/lakehouse item_id
-    report_page_tables: dict[str, dict[str, set[str]]] | None = None,  # report_id -> {page_id -> set[table_name]}
+    report_page_tables: dict[str, dict[str, set[str]]] | None = None,
+    report_page_visuals: dict[str, dict[str, list[dict]]] | None = None,
+    relationships_only: bool = False,
 ):
     """
     reports: list of dicts from list_reports + get_report_pages, each shaped as:
       {id, name, datasetId, pages: [{name, displayName, order}, ...]}
     report_warehouse_map: dataset_id -> Fabric item_id of the connected warehouse/lakehouse
-    report_page_tables: from pbix_parser — report_id -> {page_internal_id -> set[physical_table_name]}.
-      When provided, tables are parented to their specific page. Tables not found in any
-      page mapping fall back to the report as parent.
+    report_page_tables: report_id -> {page_internal_id -> set[physical_table_name]}
+    report_page_visuals: report_id -> {page_internal_id -> [{'name', 'type', 'physical_tables'}]}
+      When provided, Visual objects are written under each Page and visual→table /
+      page→table edges are written to data_lineage.relationships.
+      Tables are always parented to their Lakehouse/Warehouse artifact.
     """
     print('\nConnecting to wh_governance...')
     now = _now()
@@ -221,7 +271,8 @@ def populate_governance(
     _conn = _connect(server)
     _cur = _conn.cursor()
     _cur.execute('DELETE FROM data_lineage.relationships')
-    _cur.execute('DELETE FROM data_lineage.objects')
+    if not relationships_only:
+        _cur.execute('DELETE FROM data_lineage.objects')
     _conn.close()
 
     # ------------------------------------------------------------------
@@ -274,7 +325,6 @@ def populate_governance(
     # share the same source warehouse/lakehouse.
     # ------------------------------------------------------------------
     table_id_map: dict[tuple[str, str], str] = {}   # (lh_name.lower, table.lower) -> objects_id
-    table_parent_map: dict[str, str] = {}            # objects_id -> parent_objects_id
 
     reports_ordered = sorted(
         reports,
@@ -298,7 +348,8 @@ def populate_governance(
         source_lh_id = report_warehouse_map.get(dataset_id)
         report_tables = lh_id_to_tables.get(source_lh_id, []) if source_lh_id else []
 
-        pbix_pages = (report_page_tables or {}).get(report_id, {})
+        pbix_pages   = (report_page_tables  or {}).get(report_id, {})
+        rpt_visuals  = (report_page_visuals or {}).get(report_id, {})
         page_obj_ids: dict[str, str] = {}  # page_internal_id -> objects_id
 
         for page in pages:
@@ -320,21 +371,22 @@ def populate_governance(
                 properties_json=page_props,
             ))
 
-        # Build table -> page from PBIX (first page by order wins within this report)
-        table_to_page: dict[str, str] = {}  # table_name.lower -> page_obj_id
-        if pbix_pages:
-            for page in pages:  # pages already sorted by order
-                page_id = page['name']
-                for tbl_name in pbix_pages.get(page_id, set()):
-                    key = tbl_name.lower()
-                    if key not in table_to_page:
-                        table_to_page[key] = page_obj_ids[page_id]
+            # Visual objects under this page
+            for vis in rpt_visuals.get(page_internal, []):
+                vis_obj_id = _sha256(page_obj_id, vis['name'], vis['type'])
+                vis_props  = json.dumps({'visual_type': vis['type']})
+                obj_rows.append(_obj(
+                    vis_obj_id, 'Visual', vis['name'],
+                    f'{workspace_name}.{report_name}.{page_display}.{vis["name"]}',
+                    parent_objects_id=page_obj_id,
+                    owner_email=report_owner,
+                    properties_json=vis_props,
+                ))
 
         for tbl in report_tables:
             tbl_obj_id = _sha256(workspace_id, tbl.lh_id, tbl.schema_name, tbl.table_name)
             table_id_map[(tbl.lh_name.lower(), tbl.table_name.lower())] = tbl_obj_id
-            parent = table_to_page.get(tbl.table_name.lower(), report_id)
-            table_parent_map[tbl_obj_id] = parent
+            # Tables are always parented to their lakehouse — relationships carry page/visual links
 
     # ------------------------------------------------------------------
     # Table objects (and columns)
@@ -350,8 +402,8 @@ def populate_governance(
         tbl_obj_id = _sha256(workspace_id, tbl.lh_id, tbl.schema_name, tbl.table_name)
         table_id_map.setdefault((tbl.lh_name.lower(), tbl.table_name.lower()), tbl_obj_id)
 
-        # Parent: page if claimed, otherwise the artifact (warehouse/lakehouse)
-        parent = table_parent_map.get(tbl_obj_id, tbl.lh_id)
+        # Tables are always parented to their artifact (warehouse/lakehouse)
+        parent = tbl.lh_id
 
         props = json.dumps({'row_count': tbl.row_count, 'last_updated': tbl.last_updated})
         obj_rows.append(_obj(
@@ -376,13 +428,24 @@ def populate_governance(
             ))
             col_count += 1
 
-    print(
-        f'  Inserting {len(obj_rows)} object rows '
-        f'(1 workspace + {len(artifacts)} artifacts + {len(reports)} reports + '
-        f'{sum(len(r.get("pages", [])) for r in reports)} pages + '
-        f'{len(tables)} tables + {col_count} columns)...'
+    vis_count = sum(
+        len(vlist)
+        for rpt_vis in (report_page_visuals or {}).values()
+        for vlist in rpt_vis.values()
     )
-    _bulk_insert(server, OBJ_SQL, obj_rows, 'objects')
+    if relationships_only:
+        print(
+            f'  Skipping objects insert (--relationships-only): '
+            f'{len(obj_rows)} rows already in warehouse.'
+        )
+    else:
+        print(
+            f'  Inserting {len(obj_rows)} object rows '
+            f'(1 workspace + {len(artifacts)} artifacts + {len(reports)} reports + '
+            f'{sum(len(r.get("pages", [])) for r in reports)} pages + '
+            f'{vis_count} visuals + {len(tables)} tables + {col_count} columns)...'
+        )
+        _bulk_insert(server, OBJ_SQL, obj_rows, 'objects')
 
     # ------------------------------------------------------------------
     # Relationship rows (notebook/dataflow lineage — unchanged)
@@ -431,6 +494,60 @@ def populate_governance(
 
     _add_edges(gold_silver)
     _add_edges(silver_bronze)
+
+    # page→table and visual→table relationships (many-to-many, from PBIP visual parse)
+    if report_page_visuals:
+        # Build a flat name→obj_id lookup for physical tables (any lakehouse)
+        tbl_name_to_id: dict[str, str] = {tname: oid for (_, tname), oid in table_id_map.items()}
+
+        for report in reports:
+            report_id  = report['id']
+            pages      = report.get('pages', [])
+            rpt_visuals = report_page_visuals.get(report_id, {})
+            if not rpt_visuals:
+                continue
+
+            # Rebuild page_obj_ids for this report
+            page_obj_ids = {p['name']: _sha256(report_id, p['name']) for p in pages}
+
+            for page_internal, vis_list in rpt_visuals.items():
+                page_obj_id = page_obj_ids.get(page_internal)
+                if not page_obj_id:
+                    continue
+
+                page_tables_seen: set[str] = set()
+
+                for vis in vis_list:
+                    vis_obj_id = _sha256(page_obj_id, vis['name'], vis['type'])
+
+                    for tbl_name in vis['physical_tables']:
+                        tbl_obj_id = tbl_name_to_id.get(tbl_name)
+                        if not tbl_obj_id:
+                            continue
+
+                        # visual → table
+                        rel_id = _sha256(vis_obj_id, tbl_obj_id, 'pbip_visual')
+                        if rel_id not in seen_rels:
+                            seen_rels.add(rel_id)
+                            rel_rows.append((
+                                rel_id, vis_obj_id, tbl_obj_id,
+                                'uses', None, None, None, None,
+                                1.0, 'pbip_visual',
+                                1, now, now, now, now,
+                            ))
+
+                        # page → table (deduplicated per page)
+                        if tbl_name not in page_tables_seen:
+                            page_tables_seen.add(tbl_name)
+                            rel_id2 = _sha256(page_obj_id, tbl_obj_id, 'pbip_page')
+                            if rel_id2 not in seen_rels:
+                                seen_rels.add(rel_id2)
+                                rel_rows.append((
+                                    rel_id2, page_obj_id, tbl_obj_id,
+                                    'uses', None, None, None, None,
+                                    1.0, 'pbip_page',
+                                    1, now, now, now, now,
+                                ))
 
     print(f'  Inserting {len(rel_rows)} relationship rows...')
     _bulk_insert(server, REL_SQL, rel_rows, 'relationships')

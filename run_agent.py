@@ -9,9 +9,12 @@ Usage:
 import argparse
 import pickle
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+
+import requests
 
 from agent.config import (
     TEMPLATE_PATH, NOTEBOOKS_DIR, IN_SCOPE_TYPES, ARTIFACT_TAB_TYPES,
@@ -28,11 +31,75 @@ from agent.fabric_api import (
     list_reports, get_report_pages, get_dataset_source_item_id,
     create_warehouse, get_semantic_model_definition, get_report_definition,
 )
-from agent.pbix_parser import parse_pbix_page_tables, parse_sm_measure_deps, fetch_sm_measure_deps
+from agent.pbix_parser import (
+    parse_pbix_page_tables, parse_sm_measure_deps, fetch_sm_measure_deps,
+    fetch_sm_measure_deps_xmla, build_pbip_zip_index, parse_pbip_zip_page_tables,
+    parse_pbip_zip_visuals,
+)
 from agent.sql_api import SQLClient
 from agent.lineage import build_lineage, parse_pipeline, print_lineage_summary
 from agent.writer import write_output
-from agent.governance_writer import populate_governance, provision_governance_warehouse
+from agent.governance_writer import populate_governance, provision_governance_warehouse, read_measure_deps
+
+
+MEASURE_DEPS_NOTEBOOK_ID = '85f484cb-056e-4662-94bb-80bee0316840'
+FABRIC_API = 'https://api.fabric.microsoft.com/v1'
+
+
+def trigger_measure_deps_notebook(workspace_id: str) -> bool:
+    """
+    Trigger nb_extract_measure_deps in Fabric and wait for it to complete.
+    Returns True on success, False on failure (agent continues either way).
+    """
+    print('\nTriggering nb_extract_measure_deps notebook...')
+    try:
+        token = get_token('https://api.fabric.microsoft.com')
+        hdrs = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+
+        r = requests.post(
+            f'{FABRIC_API}/workspaces/{workspace_id}/items/{MEASURE_DEPS_NOTEBOOK_ID}'
+            '/jobs/instances?jobType=RunNotebook',
+            json={}, headers=hdrs,
+        )
+        if r.status_code != 202:
+            print(f'  WARNING: notebook trigger returned {r.status_code} — continuing with existing measure_deps')
+            return False
+
+        instance_id = r.headers.get('Location', '').rstrip('/').split('/')[-1]
+        if not instance_id:
+            print('  WARNING: could not get job instance ID — continuing with existing measure_deps')
+            return False
+
+        print(f'  Job instance: {instance_id} — polling...')
+        poll_url = (
+            f'{FABRIC_API}/workspaces/{workspace_id}/items/{MEASURE_DEPS_NOTEBOOK_ID}'
+            f'/jobs/instances/{instance_id}'
+        )
+        for i in range(40):  # max 10 minutes
+            time.sleep(15)
+            token = get_token('https://api.fabric.microsoft.com')
+            hdrs['Authorization'] = f'Bearer {token}'
+            pr = requests.get(poll_url, headers=hdrs)
+            if pr.status_code != 200:
+                continue
+            status = pr.json().get('status', '').lower()
+            elapsed = (i + 1) * 15
+            print(f'  {elapsed}s: {status}')
+            if status == 'completed':
+                print('  Notebook completed — measure_deps refreshed.')
+                return True
+            if status in ('failed', 'cancelled', 'deduped'):
+                msg = pr.json().get('failureReason') or pr.json().get('error') or ''
+                print(f'  WARNING: notebook {status}: {msg}')
+                print('  Continuing with existing measure_deps data.')
+                return False
+
+        print('  WARNING: notebook timed out — continuing with existing measure_deps')
+        return False
+
+    except Exception as e:
+        print(f'  WARNING: notebook trigger failed ({e}) — continuing with existing measure_deps')
+        return False
 
 
 def parse_args():
@@ -49,6 +116,26 @@ def parse_args():
         help='Comma-separated list of layers to include in Tables/Columns/Lineage '
              '(e.g. bronze,silver,gold). Unknown-layer items still appear in Artifacts tab. '
              'Default: include all layers.',
+    )
+    p.add_argument(
+        '--pbip-zip', default=None,
+        help='Path to a PBIP ZIP exported from PBI Desktop (e.g. PBIP_Reports_for_Michael.zip). '
+             'Reports found in the ZIP are parsed locally instead of downloading PBIX from Fabric.',
+    )
+    p.add_argument(
+        '--pbip-zip-only', action='store_true',
+        help='Only process reports whose semantic model ID appears in the PBIP ZIP. '
+             'Reports not in the ZIP are skipped entirely. Requires --pbip-zip.',
+    )
+    p.add_argument(
+        '--refresh-measure-deps', action='store_true',
+        help='Trigger the nb_extract_measure_deps Fabric notebook before reading measure_deps. '
+             'By default the notebook is NOT triggered — run it manually in the Fabric UI instead.',
+    )
+    p.add_argument(
+        '--relationships-only', action='store_true',
+        help='Skip the objects insert (objects table already populated) and only rebuild '
+             'data_lineage.relationships. Use to resume after a mid-run token expiry failure.',
     )
     return p.parse_args()
 
@@ -311,12 +398,18 @@ def main():
         if args.layers else None
     )
 
+    pbip_zip             = Path(args.pbip_zip) if args.pbip_zip else None
+    pbip_zip_only        = args.pbip_zip_only
+    refresh_measure_deps = args.refresh_measure_deps
+    relationships_only   = args.relationships_only
+
     print(f'Fabric Documentation Agent')
     print(f'Workspace : {args.workspace}')
     print(f'Dry run   : {args.dry_run}')
     print(f'Excel     : {write_excel}')
     print(f'Notebooks : {notebooks_dir}')
     print(f'Layers    : {", ".join(sorted(layer_filter)) if layer_filter else "all"}')
+    print(f'PBIP ZIP  : {pbip_zip or "none"}')
 
     # Pre-flight auth check
     print('\nChecking auth...')
@@ -438,38 +531,122 @@ def main():
     reports_with_pages = []
     report_warehouse_map: dict[str, str] = {}
     seen_datasets: set[str] = set()
+    dataset_names: dict[str, str] = {}  # ds_id -> display name (for XMLA connection)
+
+    # For DirectQuery warehouses the datasources API returns the display name as 'database',
+    # not the item GUID. Build a name→id lookup so we can resolve either form.
+    known_lh_ids = {tbl.lh_id for tbl in tables}
+    lh_name_to_id = {tbl.lh_name.lower(): tbl.lh_id for tbl in tables}
+
     for rpt in list_reports(workspace_id):
         pages = get_report_pages(workspace_id, rpt['id'])
         reports_with_pages.append({**rpt, 'pages': pages})
         ds_id = rpt.get('datasetId', '')
+        ds_name = rpt.get('datasetName', '')
+        if ds_id:
+            dataset_names[ds_id] = ds_name
         if ds_id and ds_id not in seen_datasets:
             seen_datasets.add(ds_id)
             item_id = get_dataset_source_item_id(workspace_id, ds_id)
             if item_id:
+                if item_id not in known_lh_ids:
+                    item_id = lh_name_to_id.get(item_id.lower(), item_id)
                 report_warehouse_map[ds_id] = item_id
         print(f'  {rpt["name"]}: {len(pages)} pages, source={report_warehouse_map.get(ds_id, "unknown")}')
 
-    print('\nFetching semantic model measure expressions via DAX INFO functions...')
+    print('\nFetching semantic model measure expressions...')
     known_tables = {t.table_name.lower() for t in tables}
-    sm_measure_deps: dict[str, set[str]] = {}
-    for ds_id in seen_datasets:
-        deps = fetch_sm_measure_deps(workspace_id, ds_id, known_tables)
-        if deps:
-            sm_measure_deps.update(deps)
-            print(f'  dataset {ds_id[:8]}...: {len(deps)} measure group(s) resolved')
-        else:
-            # Fall back to TMDL definition (for TMDL-native models)
-            sm_parts = get_semantic_model_definition(workspace_id, ds_id)
+
+    # Read measure_deps from wh_governance (populated manually via nb_extract_measure_deps)
+    # To force a notebook refresh pass --refresh-measure-deps
+    if refresh_measure_deps:
+        trigger_measure_deps_notebook(workspace_id)
+    sm_measure_deps = read_measure_deps(gov_server, known_tables)
+    if sm_measure_deps:
+        print(f'  Loaded {len(sm_measure_deps)} measure group(s) from wh_governance.data_lineage.measure_deps')
+    else:
+        print('  data_lineage.measure_deps is empty — falling back to API methods')
+        for ds_id in seen_datasets:
+            ds_name = dataset_names.get(ds_id, ds_id[:8])
+            # Strategy 1: XMLA via MSOLAP
+            deps = fetch_sm_measure_deps_xmla(workspace_name, dataset_names.get(ds_id, ''), known_tables)
+            if deps:
+                sm_measure_deps.update(deps)
+                print(f'  {ds_name}: {len(deps)} measure group(s) via XMLA')
+                continue
+            # Strategy 2: executeQueries REST API
+            deps = fetch_sm_measure_deps(workspace_id, ds_id, known_tables)
+            if deps:
+                sm_measure_deps.update(deps)
+                print(f'  {ds_name}: {len(deps)} measure group(s) via executeQueries')
+                continue
+            # Strategy 3: TMDL definition parts
+            try:
+                sm_parts = get_semantic_model_definition(workspace_id, ds_id)
+            except Exception as e:
+                print(f'  {ds_name}: getDefinition failed ({e}) — skipping')
+                continue
             if sm_parts:
                 deps = parse_sm_measure_deps(sm_parts, known_tables)
                 sm_measure_deps.update(deps)
-                print(f'  dataset {ds_id[:8]}...: {len(deps)} measure group(s) from TMDL')
+                print(f'  {ds_name}: {len(deps)} measure group(s) from TMDL')
             else:
-                print(f'  dataset {ds_id[:8]}...: no measure data available')
+                print(f'  {ds_name}: no measure data available')
+
+    # Build PBIP ZIP index (sm_id -> report folder inside ZIP) if provided
+    pbip_zip_index: dict[str, tuple[str, str]] = {}
+    if pbip_zip and pbip_zip.exists():
+        pbip_zip_index = build_pbip_zip_index(str(pbip_zip))
+        print(f'\nPBIP ZIP index: {len(pbip_zip_index)} report(s) found')
+        for sm_id, (zfolder, rfolder) in pbip_zip_index.items():
+            print(f'  sm={sm_id[:8]}... -> {rfolder}')
+    elif pbip_zip:
+        print(f'\nWARNING: --pbip-zip path not found: {pbip_zip}')
 
     print('\nParsing PBIX files for page->table mapping...')
-    report_page_tables: dict[str, dict[str, set[str]]] = {}
+    report_page_tables:  dict[str, dict[str, set[str]]]  = {}
+    report_page_visuals: dict[str, dict[str, list[dict]]] = {}
     for rpt in reports_with_pages:
+        ds_id = rpt.get('datasetId', '').lower()
+        # --pbip-zip-only: skip reports whose SM is not in the ZIP
+        if pbip_zip_only and ds_id not in pbip_zip_index:
+            print(f'  {rpt["name"]}: skipped (not in PBIP ZIP)')
+            continue
+        # Strategy 0: local PBIP ZIP (highest fidelity, no download needed)
+        if ds_id in pbip_zip_index:
+            _, report_folder = pbip_zip_index[ds_id]
+            page_map = parse_pbip_zip_page_tables(
+                str(pbip_zip), report_folder,
+                known_tables=known_tables,
+                measure_deps=sm_measure_deps or None,
+            )
+            if page_map:
+                # Verify the ZIP's page IDs actually match this report's pages.
+                # Two reports can share the same SM ID (e.g. dashboard_nations_adjusted
+                # and Warehouse_Dashboard) — only accept the map when IDs overlap.
+                report_page_ids = {p['name'] for p in rpt.get('pages', [])}
+                if report_page_ids & set(page_map.keys()):
+                    report_page_tables[rpt['id']] = page_map
+                    vis_map = parse_pbip_zip_visuals(
+                        str(pbip_zip), report_folder,
+                        known_tables=known_tables,
+                        measure_deps=sm_measure_deps or None,
+                    )
+                    if vis_map:
+                        report_page_visuals[rpt['id']] = vis_map
+                    total_refs = sum(len(v) for v in page_map.values())
+                    vis_count  = sum(len(v) for v in vis_map.values())
+                    print(f'  {rpt["name"]}: {len(page_map)} pages, {total_refs} table refs, {vis_count} visuals (local PBIP ZIP)')
+                    continue
+                print(f'  {rpt["name"]}: PBIP ZIP page IDs do not match this report — skipping')
+                continue
+            else:
+                print(f'  {rpt["name"]}: local PBIP ZIP parse returned no pages — falling back to API')
+
+        if pbip_zip_only:
+            print(f'  {rpt["name"]}: skipped (--pbip-zip-only, no matching ZIP page map)')
+            continue
+
         page_map = parse_pbix_page_tables(
             workspace_id, rpt['id'],
             known_tables=known_tables,
@@ -494,6 +671,8 @@ def main():
         reports=reports_with_pages,
         report_warehouse_map=report_warehouse_map,
         report_page_tables=report_page_tables,
+        report_page_visuals=report_page_visuals,
+        relationships_only=relationships_only,
     )
 
 

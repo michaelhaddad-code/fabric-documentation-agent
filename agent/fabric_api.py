@@ -382,6 +382,7 @@ def get_dataset_source_item_id(workspace_id: str, dataset_id: str) -> Optional[s
             if len(parts) >= 2:
                 return parts[1]
         elif ds_type == 'Sql':
-            # database field is the warehouse item ID for Fabric SQL endpoints
+            # database field is the warehouse display name for Fabric SQL endpoints
+            # (caller resolves to item ID via name lookup)
             return details.get('database')
     return None
